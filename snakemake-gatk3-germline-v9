@@ -1,0 +1,174 @@
+import glob
+import os
+
+# resource_path = "/isilon/resources/b37/"
+
+def target_bed_subfiles( wildcards ):
+  return glob.glob1(os.path.join(resource_path, "target_regions", wildcards.protocol), wildcards.protocol+'-[0-9][0-9][0-9].bed');
+
+
+
+samples, = glob_wildcards("{sample}_R1.fastq.gz")
+ref = "/work/sduvarcall/bwa-0.7.13/reference/human_g1k_v37_decoy.fasta"
+bed = "/work/sduvarcall/Resources/GRCh37/MedExome_target_regions/MedExome_GRCh37_capture_targets.bed"
+interval = "/work/sduvarcall/Resources/GRCh37/MedExome_target_regions/MedExome_GRCh37_capture_targets.interval_list"
+dbsnp = "/work/sduvarcall/knownSNPs/dbsnp_150.b37.vcf.gz"
+indels_mills = "/work/sduvarcall/knownSNPs/Mills_and_1000G_gold_standard.indels.b37.vcf"
+indels_1000g = "/work/sduvarcall/knownSNPs/1000G_phase1.indels.b37.vcf"
+
+
+rule all:
+  input:
+    expand("{sample}.gatk.completed", sample=samples)
+
+rule bwa_mem:
+  input:
+    r1 = "{sampleid}_{protocol}_{flowcell}_R1.fastq.gz",
+    r2 = "{sampleid}_{protocol}_{flowcell}_R2.fastq.gz"
+  output:
+    bam = temp("{sampleid}_{protocol}_{flowcell}.sorted.bam"),
+    # bai = temp("{sampleid}_{protocol}_{flowcell}.sorted.bam.bai")
+  threads: 20
+  log:
+    "{sampleid}_{protocol}_{flowcell}.bwa_mem.log"
+  benchmark:
+    "{sampleid}_{protocol}_{flowcell}.bwa_mem.benchmark.txt"
+  params:
+    rgid = "{sampleid}_{protocol}_{flowcell}",
+    rglb = "{protocol}",
+    rgsm = "{sampleid}_{protocol}_{flowcell}",
+    rgpl = "illumina",
+    rgpu = "{flowcell}"
+  shell:
+    """
+    bwa mem {ref} {input} -R \'@RG\\tID:{params.rgid}\\tLB:{params.rglb}\\tSM:{params.rgsm}\\tPL:{params.rgpl}\\tPU:{params.rgpu}\' -M -t {threads} | \
+	gatk --java-options -Xmx12g SortSam \
+	--INPUT /dev/stdin \
+	--OUTPUT {output.bam} \
+	--VALIDATION_STRINGENCY LENIENT \
+	--SORT_ORDER coordinate \
+	--CREATE_INDEX TRUE
+	"""
+
+	# bwa mem {ref} {input} -R \'@RG\\tID:{params.rgid}\\tLB:{params.rglb}\\tSM:{params.rgsm}\\tPL:{params.rgpl}\\tPU:{params.rgpu}\' -M -t {threads} | sambamba view -t {threads} -l 0 -S -f bam -o /dev/stdout /dev/stdin | sambamba sort -l 0 -t {threads} -m 60G -o {output.bam} /dev/stdin &> {log}
+
+rule markdup:
+  input:
+    bam = "{sample}.sorted.bam",
+    # bai = "{sample}.sorted.bam.bai"
+  output:
+    bam = temp("{sample}.marked.bam"),
+    # bai = temp("{sample}.marked.bam.bai")
+  threads: 20
+  log:
+    "{sample}.markdup.log"
+  benchmark:
+    "{sample}.markdup.benchmark.txt"
+  shell:
+    """
+      sambamba markdup -l 0 -t {threads} --overflow-list-size 600000 --hash-table-size 10000000 --io-buffer-size 1280 {input.bam} {output.bam} &> {log}
+    """
+
+
+rule BaseRecalibrator:
+  input:
+    bam = "{sampleid}_{protocol}_{flowcell}.marked.bam",
+    # bai = "{sampleid}_{protocol}_{flowcell}.marked.bam.bai",
+    # bed = resource_path+"target_regions/{protocol}/{protocol}.bed"
+    bed = bed
+  output:
+    "{sampleid}_{protocol}_{flowcell}.grp"
+  threads: 20
+  log:
+    "{sampleid}_{protocol}_{flowcell}.BaseRecalibrator.log"
+  benchmark:
+    "{sampleid}_{protocol}_{flowcell}.BaseRecalibrator.benchmark.txt"
+  shell:
+    """
+      gatk3 -T BaseRecalibrator -R {ref} -I {input.bam} -knownSites {dbsnp} -knownSites {indels_mills} -knownSites {indels_1000g} -o {output} -L {input.bed} --interval_padding 100 -nct {threads} -Xmx50G &> {log}
+    """
+
+
+rule PrintReads:
+  input:
+    bam = "{sample}.marked.bam",
+    # bai = "{sample}.marked.bam.bai",
+    recal = "{sample}.grp"
+  output:
+    bam = "{sample}.gatk.bam",
+    # bai = "{sample}.gatk.bai"
+  threads: 8
+  log:
+    "{sample}.PrintReads.log"
+  benchmark:
+    "{sample}.PrintReads.benchmark.txt"
+  shell:
+    """
+      gatk3 -T PrintReads -R {ref} -I {input.bam} -BQSR {input.recal} -o {output.bam} -nct 8 &> {log}
+    """
+
+
+rule CollectHsMetrics:
+  input:
+    bam = "{sampleid}_{protocol}_{flowcell}.gatk.bam",
+    # bai = "{sampleid}_{protocol}_{flowcell}.gatk.bai",
+    # interval = resource_path+"target_regions/{protocol}/{protocol}.interval"
+    interval = interval
+  output:
+    hsmetrics = "{sampleid}_{protocol}_{flowcell}.hs_metrics.txt",
+    pertargetcoverage = "{sampleid}_{protocol}_{flowcell}.per_target_coverage.txt"
+  log:
+    "{sampleid}_{protocol}_{flowcell}.CollectHsMetrics.log"
+  benchmark:
+    "{sampleid}_{protocol}_{flowcell}.CollectHsMetrics.benchmark.txt"
+  shell:
+    """
+      picard CollectHsMetrics -Xmx50G BAIT_INTERVALS={input.interval} TARGET_INTERVALS={input.interval} INPUT={input.bam} OUTPUT={output.hsmetrics} REFERENCE_SEQUENCE={ref} PER_TARGET_COVERAGE={output.pertargetcoverage} &> {log}
+    """
+
+#rule HaplotypeCaller:
+#  input:
+#    bam = "{sampleid}_{protocol}_{flowcell}.gatk.bam",
+#    bai = "{sampleid}_{protocol}_{flowcell}.gatk.bai",
+#    bed = resource_path+"target_regions/{protocol}/{bed_subfile}"
+#  output:
+#    vcf = temp("{sampleid}_{protocol}_{flowcell}__{bed_subfile}__split.vcf"),
+#    vcfidx = temp("{sampleid}_{protocol}_{flowcell}__{bed_subfile}__split.vcf.idx"),
+#  conda:
+#    "/powerhorse/data/martin/scripts/gatk-germline/gatk-germline-env.yaml"
+#  threads: 24
+#  log:
+#    "{sampleid}_{protocol}_{flowcell}.HaplotypeCaller.log"
+#  benchmark:
+#    "{sampleid}_{protocol}_{flowcell}.HaplotypeCaller.benchmark.txt"
+#  shell:
+#    """
+#      gatk3 -T HaplotypeCaller -R {ref} -I {input.bam} -o {output.vcf} -nct {threads} -Xmx50G -L {input.bed} --min_base_quality_score 20 -A Coverage -A DepthPerSampleHC -A DepthPerAlleleBySample -A BaseQualityRankSumTest -A QualByDepth
+#    """
+
+
+#rule merge_vcf:
+#  input:
+#    lambda wildcards: expand("{sampleid}_{protocol}_{flowcell}__{bed_subfile}__split.vcf", sampleid = wildcards.sampleid, protocol = wildcards.protocol, flowcell = wildcards.flowcell, bed_subfile = target_bed_subfiles(wildcards))
+#  output:
+#    vcf = "{sampleid}_{protocol}_{flowcell}.gatk.vcf",
+#    vcfidx = "{sampleid}_{protocol}_{flowcell}.gatk.vcf.idx"
+#  params: lambda wildcards, input: ' '.join(expand("-V {vcf_subfile}", vcf_subfile=input))
+#  shell:
+#    """
+#      gatk3 org.broadinstitute.gatk.tools.CatVariants -R {ref} {params} -out {output.vcf}
+#    """
+
+
+rule touch_completed:
+  output:
+    "{sample}.gatk.completed"
+  input:
+    "{sample}.gatk.bam",
+    # "{sample}.gatk.bai",
+#    "{sample}.gatk.vcf",
+    # "{sample}.hs_metrics.txt",
+    # "{sample}.per_target_coverage.txt"
+
+  shell:
+    "touch {output}"
